@@ -1,11 +1,11 @@
-# QuietSwitch — Studio Dev (chain 61997) deploy record
+# QuietSwitch v2 — Studio Dev (chain 61997) deploy record
 
 | | |
 |---|---|
 | **Network** | GenLayer Studio Dev / Studio Next — chain `61997`, GenVM `v0.3.0` |
-| **Contract** | [`0x9643Cc2Fd2ae27E2cBa77f653BBc58bcDa296f51`](https://explorer-studio-dev.genlayer.com/address/0x9643Cc2Fd2ae27E2cBa77f653BBc58bcDa296f51) |
+| **Contract** | [`0x7ACfde1Bb69023B903d599495719ad6736e5f21e`](https://explorer-studio-dev.genlayer.com/address/0x7ACfde1Bb69023B903d599495719ad6736e5f21e) |
 | **Source** | [`contracts/QuietSwitch.py`](contracts/QuietSwitch.py) — runner `py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng` |
-| **Source sha256** | `79830d6d63f22bf0d1e03610d347ba309a0579737841a4e161cda8f78b2fd2f9` |
+| **Source sha256** | `d060459e139c134b6ab0c6b4e4bffb2a0c327de7765ed367e6be75210c512570` |
 | **Console** | https://valentinzubok.github.io/QuietSwitch/ · [QuietSwitch](https://github.com/valentinzubok/QuietSwitch) |
 | **Holder / owner** | `0xBA989D240AAB780d3d2eD2201f5F677098901408` (test account) |
 | **Successor in the demo** | `0x94E6105336fD2d3Eb3E1c1a4f39e5e1d52d8B2D3` |
@@ -14,13 +14,34 @@
 
 ```bash
 curl -s -X POST https://studio-dev.genlayer.com/api -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"gen_getContractCode","params":["0x9643Cc2Fd2ae27E2cBa77f653BBc58bcDa296f51"]}' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"gen_getContractCode","params":["0x7ACfde1Bb69023B903d599495719ad6736e5f21e"]}' \
   | python3 -c "import sys,json,base64,hashlib; print(hashlib.sha256(base64.b64decode(json.load(sys.stdin)['result'])).hexdigest())"
 shasum -a 256 contracts/QuietSwitch.py
-# both print 79830d6d63f22bf0d1e03610d347ba309a0579737841a4e161cda8f78b2fd2f9
+# both print d060459e139c134b6ab0c6b4e4bffb2a0c327de7765ed367e6be75210c512570
 ```
 
 `scripts/verify_deployment.py` does the same check and runs in CI.
+
+The v1 deploy `0x9643Cc2F…` is superseded. Its miss counter had no cadence: one caller could
+satisfy the threshold by calling `check()` repeatedly against the same outage or the same stale
+page. See "What changed in v2" below.
+
+## Observation windows (v2)
+
+Each switch carries an `observation_interval`, fixed when it was armed. The transaction datetime —
+which GenVM pins per transaction, so every validator re-executing sees the same value — is divided
+into windows of that length, and the switch stores the last window it observed. A `check()` whose
+window has already been observed **reverts before the page is fetched and before any model runs**.
+
+Consequences, all enforced by the contract rather than by convention:
+
+- one window yields at most one counted observation, so the same outage or the same stale page
+  cannot be replayed into extra misses;
+- reaching `misses_required` needs that many distinct, separated observation periods;
+- a transient outage needs **two** windows before it costs anything at all: the first unreachable
+  observation is recorded as `outage_noted` without counting, and a page that comes back clears it;
+- `get_cadence(switch_id)` is a free view that tells an app whether a window is open and when the
+  next one starts, so nobody pays a fee for a call that is going to revert.
 
 ## On-chain lifecycle
 
@@ -29,20 +50,20 @@ public commit: [`web/public/fixtures/`](https://github.com/valentinzubok/QuietSw
 
 | # | Step | Result | Tx |
 |---|------|--------|----|
-| 0 | deploy | contract created | `0xce5b5724f1a8ba874a7c69e8112e229d8969586fd796201be1f97562508363d8` |
-| 1 | `arm("keys/primary", fixtures/heartbeat.html, "check-in dated no earlier than September 2026", successor, note, 2)` | armed; page, rule, successor and threshold fixed on chain | `0x3b377176cc628e3f748b63d3defcf4b14a67e38db9c0f596f1a8c97a11e169d6` |
-| 2 | `check("keys/primary")` | **alive** — the validators agreed the page states a check-in that satisfies the rule; miss counter stays 0 | `0xb366bdede4e66677512e1448fbae97fca7efb31ce6cdd3ab844bafa6a44347bd` |
-| 3 | `arm("keys/archived", fixtures/stale.html, same rule, successor, note, 1)` | armed | `0xfb22db9935fdb17122466d003f10179e395983878de138dd07b59f051166c6dc` |
-| 4 | `check("keys/archived")` | **fired** — the page loads fine (HTTP 200) and looks maintained, but its only check-in is dated 3 February 2019. The validators agreed it does not satisfy the rule, the miss reached the threshold of 1, and the switch handed over: `holder` is now the successor and the handover note is theirs. | `0x53cae970dbe6f5709641ed7455463143be673481b8afa649bd90993a2b2aac14` |
+| 0 | deploy (v2) | contract created | `0xb4303632028a35c84bba07697f5ca6068fbb1264ec7d3c82fa73cd36aec3282d` |
+| 1 | `arm("keys/demo", fixtures/stale.html, "check-in dated no earlier than September 2026", successor, note, misses_required=2, observation_interval=300)` | armed; page, rule, successor, threshold **and cadence** fixed on chain. `get_cadence` reports `observation_interval 300`, `open_now true`. | `0x543f4523c86463dcce5e3fde0f5fc52ba9a1369aac8eef3673790266ce4e0172` |
+| 2 | `check("keys/demo")` | **missed (1 of 2)** in window `5970051` — the page returns 200 and looks maintained, but its only check-in is dated 2019, so the validators agreed it is not proof of life. | `0x21470b4ea410a319777f62bc7ff5ac5b4d74203dfeb1ded5ef44d6fd76ff1d6a` |
+| 3 | `check("keys/demo")` again, immediately | **reverted** — `"this observation window has already been checked; the next one opens at 1791015600 (interval 300s)"`. The page was never fetched and no model ran, so the same stale observation could not be replayed into a second miss. | `0x460217b63a8f86e841295f056d4a61180f6009279269eb08540fc23e90990b9c` (ERROR) |
+| 4 | `check("keys/demo")` once the next window opened | **fired** in window `5970052` — a second, separated observation reached the threshold of 2, and the switch handed over: `holder` became the successor and the note is theirs. | `0x0f93a8aa3b3078fccac33fa185f0afe2226aa925c6b48c6eff70d5b0ccea3768` |
 
-| 5 | commit removes the check-in from `heartbeat.html`, then `check("keys/primary")` | **missed (1 of 2)** — the page still loads and still reads like a status page, but the check-in line is gone, so the validators agreed it is not proof of life. Two earlier checks, run before the renderer's cache expired, still saw the old text and correctly answered *alive* for the text they were given. | `0x576804e8a08e60de1cbd1122555838064eaa3a03a03909eaad39f53511e419c0` (earlier, cached: `0xd57f621d8ee7974f346025f360195c3394874d6153ae75a1eafefc5978473e4d`, `0xd4de8946cbc68325f9344776be173a7c499e01e6d3051b130ee39d461baeb0d2`) |
-| 6 | `check("keys/primary")` again | **fired** — second consecutive miss reaches the threshold of 2 and the switch hands over: `holder` becomes the successor and the handover note is theirs. | `0x9a9326f4f42f7fb6ac3a2f62f491570a310a02905ba462f2cd1aae34af872b4d` |
+State (`get_stats`): `{"switches":1,"armed":0,"fired":1,"disarmed":0,"pending_misses":0,"checks":2}` —
+three `check` transactions, only **two** counted observations, in two different windows.
 
-State (`get_stats`): `{"switches":2,"armed":0,"fired":2,"disarmed":0,"pending_misses":0,"checks":7}`
+Steps 2–4 are the whole point of v2: the firing took two observations that the contract itself
+forced apart, and the attempt in between was refused by the contract rather than by politeness.
 
-Step 4 is the case an uptime monitor cannot see. Nothing about the page is *broken* — it is up, it
-returns 200, it reads like a maintained status page. What it no longer contains is proof of life,
-and that is a judgement about meaning, which is why it belongs under consensus.
+The interval is 300 s here so the flow is reproducible in minutes; a real switch would use hours or
+days (the console defaults to 86 400 s, and the contract accepts 60 s – 30 days).
 
 ### A note on the page renderer's cache
 
@@ -53,6 +74,21 @@ the transaction's equivalence output still contained "28 September 2026" — and
 the migrated page and recorded the miss. Anyone reproducing the "holder goes quiet" flow should
 allow for that delay; the contract judges whatever text the validators actually agreed on, which is
 exactly the property that makes the verdict auditable.
+
+## What changed in v2
+
+| Steward request | Change |
+|---|---|
+| One caller must not satisfy the miss threshold through immediate repeated checks of the same outage or stale observation | `arm()` takes a required `observation_interval`; `check()` computes `window = tx_datetime // interval` and reverts when `window <= last_window`, **before** fetching the page or spending a model. Proven on chain by tx `0x460217b6…`. |
+| Each counted miss must represent a distinct, enforceably separated observation period or other non-replayable event | The window id *is* the uniqueness state, and it lives in contract storage (`last_window`, `last_counted_window`, `last_check_at`). `misses_required` misses therefore need that many separated windows; each `Missed` / `Fired` event records its window and timestamp, and a repeat of identical page text is flagged `unchanged_page`. |
+| An unreachable page currently counts toward irreversible handover | It no longer does on its own. The first unreachable observation is `outage_noted`: recorded, not counted. Only an outage that persists into a **different** window counts, and a page that comes back clears `outage_pending`. A transient blip can cost nothing, however many times it is polled. |
+| Include the cadence or uniqueness state in the contract | Stored per switch (`observation_interval`, `armed_at`, `last_check_at`, `last_window`, `last_counted_window`, `outage_pending`) and exposed by the free `get_cadence(switch_id)` view, so an app can tell whether a window is open before paying a fee. |
+| Matching submitted and deployed source | Redeployed at `0x7ACfde1Bb69023B903d599495719ad6736e5f21e`; on-chain sha256 == `contracts/QuietSwitch.py` == `d060459e…`, re-checked by `scripts/verify_deployment.py` in CI. |
+| Tests | `tests/test_adversarial.py` adds: a second check in the same window reverts and fetches nothing; firing needs as many separated windows as `misses_required`; one second short of a window is not a window; a transient outage hammered by three different callers cannot fire a 1-miss switch and leaves no trace once the page returns; a stale page counts once per window and the events prove two distinct windows; `rearm` clears a pending outage. 40 tests. |
+
+The clock is the transaction datetime, which GenVM pins per transaction, so every validator
+re-executing a `check` computes the same window. The test double wires `datetime.now()` to a
+controllable value for exactly that reason, so the windows are tested without sleeping.
 
 ## What the validators are actually asked
 

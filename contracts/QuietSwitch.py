@@ -5,6 +5,7 @@ import genlayer as gl
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 
 # QuietSwitch v1.0 — a dead-man's switch that only fires on consensus.
 # Copyright (c) 2026 Valentyn Zubok. MIT License.
@@ -17,8 +18,16 @@ import re
 #   * alive        -> the miss counter resets; the switch stays armed
 #   * not alive    -> one miss is recorded; after `misses_required` consecutive misses the
 #                     switch FIRES and the successor takes the handover note
-#   * unreachable  -> counted as a miss, because a heartbeat nobody can read is not a
-#                     heartbeat — but the page hash and reason are recorded for review
+#   * unreachable  -> the FIRST outage is only noted, not counted; a later outage in a
+#                     different observation window counts, because a heartbeat nobody can
+#                     read is not a heartbeat while a two-minute blip is not silence
+#
+# Misses cannot be manufactured by calling check() repeatedly. Every switch carries an
+# observation interval, fixed when it was armed, and the chain's transaction datetime is
+# divided into windows of that length. A window that has already been observed is closed:
+# a second check inside it reverts before any page is fetched or any model is spent. One
+# window therefore yields at most one counted miss, and `misses_required` misses need that
+# many distinct, separated observation periods.
 #
 # Firing is the consequential action here, so the fail-safe direction is the opposite of a
 # monitor: a malformed model answer, a model error or a consensus failure REVERTS the
@@ -39,11 +48,16 @@ MAX_WINDOWS = 6
 MIN_KEYWORD_LEN = 5
 HASH_ALGO = "sha256"
 
+# Observation cadence: the separation a counted miss must respect.
+MIN_INTERVAL_SECONDS = 60
+MAX_INTERVAL_SECONDS = 2_592_000  # 30 days
+
 STATUS_ARMED = "armed"
 STATUS_FIRED = "fired"
 STATUS_DISARMED = "disarmed"
 
 RESULT_ALIVE = "alive"
+RESULT_OUTAGE_NOTED = "outage_noted"
 RESULT_MISS = "missed"
 RESULT_UNREACHABLE = "unreachable"
 RESULT_FIRED = "fired"
@@ -185,6 +199,31 @@ def injection_flags(*texts) -> list:
             if marker in low and marker not in found:
                 found.append(marker)
     return found
+
+
+def now_seconds() -> int:
+    """The transaction datetime as unix seconds.
+
+    GenVM pins the clock to the transaction, so every validator re-executing this call
+    sees the same number. That is what makes the observation windows below enforceable
+    rather than advisory.
+    """
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def parse_interval(value) -> int:
+    try:
+        seconds = int(str(value).strip())
+    except Exception:
+        raise Exception("observation_interval must be an integer number of seconds")
+    if seconds < MIN_INTERVAL_SECONDS or seconds > MAX_INTERVAL_SECONDS:
+        raise Exception("observation_interval must be between 60 and 2592000 seconds")
+    return seconds
+
+
+def observation_window(now: int, interval: int) -> int:
+    """Which observation period `now` falls into. One counted miss per window, at most."""
+    return now // interval
 
 
 def literal_bool(value):
@@ -378,12 +417,19 @@ class QuietSwitch(gl.contract.Contract):
         successor: str,
         note: str,
         misses_required: str = "2",
+        observation_interval: str = "86400",
     ) -> None:
-        """Arm a switch against a liveness page, committing the rule and the successor.
+        """Arm a switch against a liveness page, committing the whole firing condition.
 
-        The page, the freshness rule, the successor and the number of consecutive misses
-        are all fixed here, by the holder. Nothing about the firing condition can be chosen
-        later, by anyone — including the successor who stands to gain from it.
+        The page, the freshness rule, the successor, the number of consecutive misses and
+        the observation interval are all fixed here, by the holder. Nothing about the
+        firing condition can be chosen later, by anyone — including the successor who
+        stands to gain from it.
+
+        observation_interval is the cadence a counted miss must respect: the transaction
+        clock is divided into windows of that many seconds, and each window yields at most
+        one counted observation. Repeated calls inside a window revert, so the same outage
+        cannot be replayed into a handover.
         """
         sid = _normalize_id(switch_id)
         switches = self._load()
@@ -405,6 +451,8 @@ class QuietSwitch(gl.contract.Contract):
             raise Exception("misses_required must be an integer")
         if required < 1 or required > 10:
             raise Exception("misses_required must be between 1 and 10")
+        interval = parse_interval(observation_interval)
+        armed_at = now_seconds()
 
         switches[sid] = {
             "switch_id": sid,
@@ -416,9 +464,16 @@ class QuietSwitch(gl.contract.Contract):
             "status": STATUS_ARMED,
             "misses": 0,
             "misses_required": required,
+            "observation_interval": interval,
+            "armed_at": armed_at,
+            "last_check_at": 0,
+            "last_window": 0,
+            "last_counted_window": 0,
+            "outage_pending": False,
             "checks": 0,
             "last_result": "armed",
             "last_page_hash": "",
+            "last_miss_hash": "",
             "last_detail": "",
             "injection_flags": [],
             "fired_to": "",
@@ -434,6 +489,8 @@ class QuietSwitch(gl.contract.Contract):
                 "holder": holder,
                 "successor": successor_addr,
                 "misses_required": required,
+                "observation_interval": interval,
+                "at": armed_at,
             },
         )
 
@@ -444,11 +501,33 @@ class QuietSwitch(gl.contract.Contract):
         Anyone may call this: the switch is only as trustworthy as its ability to be checked
         by someone other than the holder. The URL is the committed one, so a caller cannot
         substitute a page that says what they want.
+
+        A counted observation is rate-limited by the switch's own observation_interval. The
+        transaction clock is split into windows of that length and `last_window` records the
+        last one observed, so a second call inside the same window reverts *before* the page
+        is fetched: the same outage, or the same stale page, cannot be replayed into extra
+        misses. Reaching `misses_required` therefore takes that many distinct, separated
+        observation periods, and a transient outage additionally needs two of them (the
+        first is only noted).
         """
         sid, switches = self._switch_or_raise(switch_id)
         entry = switches[sid]
         if entry.get("status") != STATUS_ARMED:
             raise Exception("switch is not armed")
+
+        interval = int(entry.get("observation_interval", 86400))
+        now = now_seconds()
+        window = observation_window(now, interval)
+        last_window = int(entry.get("last_window", 0))
+        if window <= last_window:
+            opens_at = (last_window + 1) * interval
+            raise Exception(
+                "this observation window has already been checked; the next one opens at "
+                + str(opens_at)
+                + " (interval "
+                + str(interval)
+                + "s)"
+            )
 
         url = entry.get("heartbeat_url", "")
         rule = entry.get("rule", "")
@@ -459,13 +538,13 @@ class QuietSwitch(gl.contract.Contract):
         snap = json.loads(gl.eq_principle.strict_eq(fetch_fn))
         self.checks = str(int(self.checks) + 1)
         entry["checks"] = int(entry.get("checks", 0)) + 1
+        entry["last_check_at"] = now
+        entry["last_window"] = window
 
-        if snap.get("status") != "ok":
-            # A heartbeat nobody can read is not a heartbeat, so this counts as a miss —
-            # but the reason is recorded, because "the host was down" is worth seeing.
-            alive = False
-            detail = "heartbeat page unreachable or empty: " + str(snap.get("detail", ""))[:80]
+        reachable = snap.get("status") == "ok"
+        if not reachable:
             entry["last_page_hash"] = ""
+            alive = False
         else:
             digest = snap.get("digest") or {}
             if not digest.get("excerpts"):
@@ -476,42 +555,76 @@ class QuietSwitch(gl.contract.Contract):
             entry["injection_flags"] = flags[:6]
             entry["last_page_hash"] = snap.get("content_hash", "")
             alive = decide_liveness(rule, digest, flags)
-            detail = (
-                "validators agreed the page shows proof of life"
-                if alive
-                else ("validators agreed the page does not satisfy the rule")
-            )
 
         if alive:
             entry["misses"] = 0
+            entry["outage_pending"] = False
             entry["status"] = STATUS_ARMED
             entry["last_result"] = RESULT_ALIVE
-            entry["last_detail"] = detail
-            self._event("Alive", {"id": sid, "page_hash": entry["last_page_hash"]})
+            entry["last_detail"] = "validators agreed the page shows proof of life"
+            self._event(
+                "Alive",
+                {"id": sid, "page_hash": entry["last_page_hash"], "window": window, "at": now},
+            )
             switches[sid] = entry
             self._save(switches)
             return
 
+        if not reachable and not entry.get("outage_pending", False):
+            # A single outage is a blip, not silence. Note it and require another window.
+            entry["outage_pending"] = True
+            entry["last_result"] = RESULT_OUTAGE_NOTED
+            entry["last_detail"] = (
+                "heartbeat page unreachable ("
+                + str(snap.get("detail", ""))[:60]
+                + "); first outage is noted, not counted"
+            )
+            switches[sid] = entry
+            self._save(switches)
+            self._event(
+                "OutageNoted",
+                {"id": sid, "window": window, "at": now, "misses": int(entry.get("misses", 0))},
+            )
+            return
+
+        if not reachable:
+            entry["last_detail"] = (
+                "heartbeat page unreachable in a second observation window: "
+                + str(snap.get("detail", ""))[:60]
+            )
+        else:
+            entry["outage_pending"] = False
+            entry["last_detail"] = "validators agreed the page does not satisfy the rule"
+
+        repeated = bool(
+            reachable
+            and entry.get("last_miss_hash")
+            and entry["last_miss_hash"] == entry["last_page_hash"]
+        )
+        entry["last_miss_hash"] = entry["last_page_hash"]
         entry["misses"] = int(entry.get("misses", 0)) + 1
-        entry["last_detail"] = detail
+        entry["last_counted_window"] = window
         required = int(entry.get("misses_required", 2))
 
         if entry["misses"] < required:
             entry["last_result"] = RESULT_MISS
+            switches[sid] = entry
+            self._save(switches)
             self._event(
                 "Missed",
                 {
                     "id": sid,
                     "misses": entry["misses"],
                     "misses_required": required,
-                    "detail": detail[:160],
+                    "window": window,
+                    "at": now,
+                    "unchanged_page": repeated,
+                    "detail": entry["last_detail"][:160],
                 },
             )
-            switches[sid] = entry
-            self._save(switches)
             return
 
-        # Enough consecutive silence: hand over.
+        # Enough separated observations of silence: hand over.
         previous = entry.get("holder", "")
         entry["status"] = STATUS_FIRED
         entry["last_result"] = RESULT_FIRED
@@ -526,8 +639,10 @@ class QuietSwitch(gl.contract.Contract):
                 "from": previous,
                 "to": entry["fired_to"],
                 "misses": entry["misses"],
+                "window": window,
+                "at": now,
                 "page_hash": entry.get("last_page_hash", ""),
-                "detail": detail[:160],
+                "detail": entry["last_detail"][:160],
             },
         )
 
@@ -555,10 +670,14 @@ class QuietSwitch(gl.contract.Contract):
             raise Exception("switch has already fired")
         entry["status"] = STATUS_ARMED
         entry["misses"] = 0
+        entry["outage_pending"] = False
         entry["last_result"] = "armed"
         switches[sid] = entry
         self._save(switches)
-        self._event("Armed", {"id": sid, "holder": entry.get("holder", "")})
+        self._event(
+            "Armed",
+            {"id": sid, "holder": entry.get("holder", ""), "at": now_seconds()},
+        )
 
     @gl.public.write
     def transfer_ownership(self, new_owner: str) -> None:
@@ -594,6 +713,37 @@ class QuietSwitch(gl.contract.Contract):
     @gl.public.view
     def get_owner(self) -> str:
         return self.owner
+
+    @gl.public.view
+    def get_cadence(self, switch_id: str) -> str:
+        """When this switch may next be observed, so an app never wastes a fee."""
+        sid = _normalize_id(switch_id)
+        switches = self._load()
+        if sid not in switches:
+            return json.dumps({"error": "unknown switch_id"})
+        entry = switches[sid]
+        interval = int(entry.get("observation_interval", 86400))
+        now = now_seconds()
+        window = observation_window(now, interval)
+        last_window = int(entry.get("last_window", 0))
+        open_now = window > last_window
+        return json.dumps(
+            {
+                "switch_id": sid,
+                "observation_interval": interval,
+                "now": now,
+                "window": window,
+                "last_window": last_window,
+                "last_check_at": int(entry.get("last_check_at", 0)),
+                "open_now": open_now,
+                "next_window_opens_at": (last_window + 1) * interval,
+                "outage_pending": bool(entry.get("outage_pending", False)),
+                "misses": int(entry.get("misses", 0)),
+                "misses_required": int(entry.get("misses_required", 2)),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @gl.public.view
     def get_stats(self) -> str:

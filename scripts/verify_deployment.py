@@ -9,7 +9,7 @@ import sys
 import urllib.request
 
 RPC = "https://studio-dev.genlayer.com/api"
-ADDRESS = "0x9643Cc2Fd2ae27E2cBa77f653BBc58bcDa296f51"
+ADDRESS = "0x7ACfde1Bb69023B903d599495719ad6736e5f21e"
 SOURCE = pathlib.Path(__file__).resolve().parents[1] / "contracts" / "QuietSwitch.py"
 
 
