@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 mod = load_contract(ROOT)
 gl = sys.modules["genlayer"]
 
-OWNER = "0x1111111111111111111111111111111111111111"
-HOLDER = OWNER
+HOLDER = "0x1111111111111111111111111111111111111111"
+DEPLOYER = "0x9999999999999999999999999999999999999999"
 SUCCESSOR = "0x2222222222222222222222222222222222222222"
 STRANGER = "0x3333333333333333333333333333333333333333"
 
@@ -25,9 +25,13 @@ NOTE = "Rotate the signing key with the procedure in runbook 7; the shard is wit
 
 
 def _armed(required="2", interval=str(DAY)):
+    """Deploy from one account, arm from another, and let the first interval elapse."""
     reset(gl)
-    c = mod.QuietSwitch(OWNER)
+    gl.message.sender_address = DEPLOYER
+    c = mod.QuietSwitch()
+    gl.message.sender_address = HOLDER
     c.arm("keys/primary", URL, RULE, SUCCESSOR, NOTE, required, interval)
+    advance(gl, int(interval))
     return c
 
 
@@ -86,7 +90,7 @@ def test_consecutive_silence_fires_the_switch_to_the_successor():
 
 
 def test_a_single_outage_is_noted_not_counted():
-    """One unreachable observation is a blip; silence needs a second window."""
+    """One unreachable observation is a blip; silence needs a second, separated observation."""
     c = _armed("1")
     gl.page = Exception("connection refused")
     c.check("keys/primary")
@@ -101,7 +105,7 @@ def test_a_single_outage_is_noted_not_counted():
     c.check("keys/primary")
     entry = json.loads(c.get_switch("keys/primary"))
     assert entry["status"] == "fired"
-    assert "second observation window" in entry["last_detail"]
+    assert "a full interval later" in entry["last_detail"]
 
 
 def test_an_outage_that_ends_does_not_leave_a_pending_mark():
@@ -122,7 +126,7 @@ def test_an_outage_that_ends_does_not_leave_a_pending_mark():
 def test_disarm_and_rearm_are_holder_only():
     c = _armed()
     gl.message.sender_address = STRANGER
-    with pytest.raises(Exception, match="only the holder or the owner"):
+    with pytest.raises(Exception, match="only the current holder"):
         c.disarm("keys/primary")
     gl.message.sender_address = HOLDER
     c.disarm("keys/primary")
@@ -138,8 +142,13 @@ def test_a_fired_switch_cannot_be_disarmed_by_the_old_holder():
     gl.llm_reply = '{"alive": false}'
     c.check("keys/primary")
     assert json.loads(c.get_switch("keys/primary"))["status"] == "fired"
+    with pytest.raises(Exception, match="only the current holder"):
+        c.disarm("keys/primary")  # the old holder no longer holds it
+    gl.message.sender_address = SUCCESSOR
     with pytest.raises(Exception, match="already fired"):
-        c.disarm("keys/primary")
+        c.disarm("keys/primary")  # and fired is final even for the new holder
+    with pytest.raises(Exception, match="already fired"):
+        c.rearm("keys/primary")
 
 
 def test_the_cadence_view_tells_an_app_when_it_may_check():
@@ -150,7 +159,8 @@ def test_the_cadence_view_tells_an_app_when_it_may_check():
     c.check("keys/primary")
     cadence = json.loads(c.get_cadence("keys/primary"))
     assert cadence["open_now"] is False
-    assert cadence["next_window_opens_at"] > cadence["now"]
+    assert cadence["next_check_at"] == cadence["now"] + DAY
+    assert cadence["seconds_until_open"] == DAY
     advance(gl, DAY)
     assert json.loads(c.get_cadence("keys/primary"))["open_now"] is True
 
@@ -188,4 +198,4 @@ def test_validation_rules():
         c.arm("keys/j", URL, RULE, SUCCESSOR, NOTE, "2", "soon")
     assert json.loads(c.get_switch("nope"))["error"] == "unknown switch_id"
     assert json.loads(c.list_by_status("armed")) == ["keys/primary"]
-    assert c.get_owner() == OWNER
+    assert c.get_admin() == ""

@@ -79,7 +79,7 @@ def load_contract(repo_root: Path, filename: str = "QuietSwitch.py"):
     """Load the contract, with the clock wired to gl.clock.
 
     On chain, `datetime.now()` returns the transaction datetime: deterministic, identical
-    for every validator. The stub below reproduces that so the observation windows can be
+    for every validator. The stub below reproduces that so the observation interval can be
     tested without sleeping, and so a test cannot accidentally depend on wall-clock time.
     """
     _install_fake_genlayer()
@@ -103,7 +103,7 @@ def load_contract(repo_root: Path, filename: str = "QuietSwitch.py"):
 
 
 def advance(gl, seconds: int) -> None:
-    """Move the transaction clock forward, e.g. into the next observation window."""
+    """Move the transaction clock forward, e.g. past the observation interval."""
     gl.clock += int(seconds)
 
 
